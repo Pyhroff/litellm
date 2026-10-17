@@ -5052,10 +5052,33 @@ async def generate_key_helper_fn(
         if isinstance(saved_token["metadata"], str):
             saved_token["metadata"] = json.loads(saved_token["metadata"])
         if isinstance(saved_token["permissions"], str):
-            if "get_spend_routes" in saved_token["permissions"] and premium_user is not True:
-                raise ValueError("get_spend_routes permission is only available for LiteLLM Enterprise users")
-
-            saved_token["permissions"] = json.loads(saved_token["permissions"])
+            try:
+                parsed_perms = json.loads(saved_token["permissions"])
+            except Exception:
+                parsed_perms = {}
+            if isinstance(parsed_perms, dict):
+                val = parsed_perms.get("get_spend_routes")
+                is_spend_routes_enabled = val is True or (isinstance(val, str) and val.strip().lower() in ("true", "1"))
+                if is_spend_routes_enabled and premium_user is not True:
+                    from litellm.proxy._types import CommonProxyErrors
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail={
+                            "error": f"get_spend_routes permission is only available for LiteLLM Enterprise users. {CommonProxyErrors.not_premium_user.value}"
+                        },
+                    )
+            saved_token["permissions"] = parsed_perms
+        elif isinstance(saved_token["permissions"], dict):
+            val = saved_token["permissions"].get("get_spend_routes")
+            is_spend_routes_enabled = val is True or (isinstance(val, str) and val.strip().lower() in ("true", "1"))
+            if is_spend_routes_enabled and premium_user is not True:
+                from litellm.proxy._types import CommonProxyErrors
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "error": f"get_spend_routes permission is only available for LiteLLM Enterprise users. {CommonProxyErrors.not_premium_user.value}"
+                    },
+                )
         if isinstance(saved_token["model_max_budget"], str):
             saved_token["model_max_budget"] = json.loads(saved_token["model_max_budget"])
         router_settings = cast(dict | None, saved_token.get("router_settings"))
