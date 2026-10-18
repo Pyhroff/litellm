@@ -76,3 +76,61 @@ async def test_mcp_server_config_auth_value_header_used(token_key, config_only_m
     emitted = next(client._resolved_auth.auth_flow(httpx2.Request("POST", server.url)))
     assert emitted.headers["Authorization"] == "Bearer example_token"
     assert client.auth_type == MCPAuth.bearer_token
+
+
+@pytest.mark.asyncio
+async def test_mcp_server_byok_resolves_per_request_alias_authorization_header():
+    """Ensure BYOK/static-auth servers without stored DB credentials resolve per-request
+    x-mcp-{alias}-authorization headers passed via raw_headers (#46664).
+    """
+    byok_server = MCPServer(
+        server_id="test-byok-server",
+        name="Test BYOK Server",
+        server_name="test_byok_server",
+        alias="test_byok",
+        url="https://api.example.com/mcp",
+        transport=MCPTransport.http,
+        auth_type=MCPAuth.bearer_token,
+        authentication_token=None,
+    )
+
+    manager = MCPServerManager()
+
+    # Pass per-request header in raw_headers with mcp_auth_header=None
+    client = await manager.create_mcp_client(
+        server=byok_server,
+        mcp_auth_header=None,
+        raw_headers={"x-mcp-test_byok-authorization": "Bearer token_from_byok_header"},
+    )
+
+    assert client._mcp_auth_value == {"Authorization": "Bearer token_from_byok_header"}
+    assert client._get_auth_headers() == {"Authorization": "Bearer token_from_byok_header"}
+    assert client.auth_type == MCPAuth.bearer_token
+
+
+def test_prepare_mcp_server_headers_resolves_per_request_alias_header():
+    """Ensure _prepare_mcp_server_headers extracts server_auth_header from raw_headers
+    when mcp_server_auth_headers and mcp_auth_header are None (#46664).
+    """
+    from litellm.proxy._experimental.mcp_server.operations import _prepare_mcp_server_headers
+
+    server = MCPServer(
+        server_id="test-alias-server",
+        name="Test Alias Server",
+        server_name="github_mcp",
+        alias="github",
+        url="https://api.example.com/mcp",
+        transport=MCPTransport.http,
+        auth_type=MCPAuth.bearer_token,
+        authentication_token=None,
+    )
+
+    server_auth, extra = _prepare_mcp_server_headers(
+        server=server,
+        mcp_server_auth_headers=None,
+        mcp_auth_header=None,
+        oauth2_headers=None,
+        raw_headers={"x-mcp-github-authorization": "Bearer gh_secret_token_123"},
+    )
+
+    assert server_auth == {"Authorization": "Bearer gh_secret_token_123"}

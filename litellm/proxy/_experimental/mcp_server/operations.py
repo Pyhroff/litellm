@@ -1003,6 +1003,27 @@ def _prepare_mcp_server_headers(
     if server_auth_header is None:
         server_auth_header = mcp_auth_header
 
+    if server_auth_header is None and raw_headers:
+        from litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp import (
+            MCPRequestHandler,
+        )
+        from litellm.proxy._experimental.mcp_server.utils import (
+            lookup_mcp_server_auth_in_headers,
+        )
+
+        extracted_headers = MCPRequestHandler.get_mcp_server_auth_headers_from_headers(raw_headers)
+        if extracted_headers:
+            server_auth_header = lookup_mcp_server_auth_in_headers(
+                extracted_headers,
+                alias=server.alias,
+                server_name=server.server_name,
+                access_groups=server.access_groups,
+            )
+        if server_auth_header is None:
+            fallback = MCPRequestHandler.get_mcp_auth_header_from_headers(raw_headers)
+            if fallback:
+                server_auth_header = fallback
+
     return server_auth_header, extra_headers
 
 

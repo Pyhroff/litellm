@@ -4319,6 +4319,17 @@ class MCPServerManager:
         client_ip: str | None = None,
         protocol_version_override: MCPUpstreamProtocol | None = None,
     ) -> MCPClient:
+        if mcp_auth_header is None and raw_headers:
+            from litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp import (
+                MCPRequestHandler,
+            )
+
+            extracted_server_headers = MCPRequestHandler.get_mcp_server_auth_headers_from_headers(raw_headers)
+            fallback_auth = MCPRequestHandler.get_mcp_auth_header_from_headers(raw_headers)
+            resolved_auth = _server_auth_header_for(server, extracted_server_headers, fallback_auth)
+            if resolved_auth is not None:
+                mcp_auth_header = resolved_auth
+
         self.catalog.assert_current(server)
         record_auth_resolution(server.server_id, AuthResolution.unresolved)
         resolved_server: Final = await self.ensure_oauth_metadata_discovered(server)
