@@ -172,6 +172,116 @@ class TestBuildDebugHeaders:
         }
         assert set(headers.keys()) == expected_keys
 
+    def test_non_admin_omits_infrastructure_headers(self):
+        headers = MCPDebug.build_debug_headers(
+            inbound_headers={"x-litellm-api-key": "Bearer sk-user-key"},
+            oauth2_headers={"Authorization": "Bearer oauth2-token"},
+            litellm_api_key="Bearer sk-user-key",
+            auth_resolution="oauth2-passthrough",
+            server_url="https://internal-server.private",
+            server_auth_type="oauth2",
+            is_admin=False,
+        )
+        assert "x-mcp-debug-inbound-auth" in headers
+        assert "x-mcp-debug-oauth2-token" in headers
+        assert "x-mcp-debug-auth-resolution" not in headers
+        assert "x-mcp-debug-outbound-url" not in headers
+        assert "x-mcp-debug-server-auth-type" not in headers
+
+
+class TestIsAdminAuth:
+    def test_none_returns_false(self):
+        assert MCPDebug.is_admin_auth(None) is False
+
+    def test_proxy_admin_role_returns_true(self):
+        from litellm.types.proxy.auth.user_roles import LitellmUserRoles
+
+        class MockAuth:
+            user_role = LitellmUserRoles.PROXY_ADMIN
+
+        assert MCPDebug.is_admin_auth(MockAuth()) is True
+
+    def test_proxy_admin_viewer_role_returns_true(self):
+        from litellm.types.proxy.auth.user_roles import LitellmUserRoles
+
+        class MockAuth:
+            user_role = LitellmUserRoles.PROXY_ADMIN_VIEW_ONLY
+
+        assert MCPDebug.is_admin_auth(MockAuth()) is True
+
+    def test_internal_user_returns_false(self):
+        from litellm.types.proxy.auth.user_roles import LitellmUserRoles
+
+        class MockAuth:
+            user_role = LitellmUserRoles.INTERNAL_USER
+
+        assert MCPDebug.is_admin_auth(MockAuth()) is False
+
+    def test_dict_user_role(self):
+        assert MCPDebug.is_admin_auth({"user_role": "proxy_admin"}) is True
+        assert MCPDebug.is_admin_auth({"user_role": "proxy_admin_viewer"}) is True
+        assert MCPDebug.is_admin_auth({"user_role": "internal_user"}) is False
+        assert MCPDebug.is_admin_auth({}) is False
+
+
+class TestMaybeBuildDebugHeaders:
+    def test_debug_disabled_returns_empty(self):
+        assert MCPDebug.maybe_build_debug_headers(
+            raw_headers={"host": "localhost"},
+            scope={"headers": []},
+            mcp_servers=["test_srv"],
+            oauth2_headers=None,
+            client_ip="127.0.0.1",
+        ) == {}
+
+    def test_non_admin_caller_omits_upstream_url(self):
+        from unittest.mock import MagicMock, patch
+
+        mock_server = MagicMock(url="http://internal-db:8000", auth_type="bearer_token")
+        with patch(
+            "litellm.proxy._experimental.mcp_server.mcp_server_manager.global_mcp_server_manager.get_mcp_server_by_name",
+            return_value=mock_server,
+        ):
+            headers = MCPDebug.maybe_build_debug_headers(
+                raw_headers={
+                    "x-litellm-mcp-debug": "true",
+                    "x-litellm-api-key": "Bearer sk-internal-user",
+                },
+                scope={"headers": [(b"x-litellm-api-key", b"Bearer sk-internal-user")]},
+                mcp_servers=["test_srv"],
+                oauth2_headers=None,
+                client_ip="127.0.0.1",
+                user_api_key_auth={"user_role": "internal_user"},
+            )
+            assert "x-mcp-debug-inbound-auth" in headers
+            assert "x-mcp-debug-oauth2-token" in headers
+            assert "x-mcp-debug-outbound-url" not in headers
+            assert "x-mcp-debug-server-auth-type" not in headers
+            assert "x-mcp-debug-auth-resolution" not in headers
+
+    def test_admin_caller_includes_upstream_url(self):
+        from unittest.mock import MagicMock, patch
+
+        mock_server = MagicMock(url="http://internal-db:8000", auth_type="bearer_token")
+        with patch(
+            "litellm.proxy._experimental.mcp_server.mcp_server_manager.global_mcp_server_manager.get_mcp_server_by_name",
+            return_value=mock_server,
+        ):
+            headers = MCPDebug.maybe_build_debug_headers(
+                raw_headers={
+                    "x-litellm-mcp-debug": "true",
+                    "x-litellm-api-key": "Bearer sk-admin",
+                },
+                scope={"headers": [(b"x-litellm-api-key", b"Bearer sk-admin")]},
+                mcp_servers=["test_srv"],
+                oauth2_headers=None,
+                client_ip="127.0.0.1",
+                user_api_key_auth={"user_role": "proxy_admin"},
+            )
+            assert headers["x-mcp-debug-outbound-url"] == "http://internal-db:8000"
+            assert headers["x-mcp-debug-server-auth-type"] == "bearer_token"
+            assert "x-mcp-debug-auth-resolution" in headers
+
 
 class TestWrapSendWithDebugHeaders:
     def test_injects_headers(self):
@@ -459,6 +569,17 @@ def test_diagnostics_keep_requests_separate_and_do_not_collapse_multiple_servers
     alice.record("s2", AuthResolution.static_token)
     assert alice.resolution() == "multiple"
     assert alice.headers()["x-mcp-debug-auth-resolutions"] == '{"s1":"token-exchange","s2":"static-token"}'
+
+
+def test_diagnostics_non_admin_returns_empty_headers() -> None:
+    diag: Final = MCPAuthDiagnostics(is_admin=False)
+    diag.record("s1", AuthResolution.stored_user_token)
+    assert diag.resolution() == "stored-user-token"
+    assert diag.headers() == {}
+
+    diag.record("s2", AuthResolution.static_token)
+    assert diag.resolution() == "multiple"
+    assert diag.headers() == {}
 
 
 @pytest.mark.asyncio

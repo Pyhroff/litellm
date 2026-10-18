@@ -2472,14 +2472,17 @@ if MCP_AVAILABLE:
             )
 
             # Inject masked debug headers when client sends x-litellm-mcp-debug: true
+            _is_admin: Final = MCPDebug.is_admin_auth(user_api_key_auth)
             _debug_headers: Final = MCPDebug.maybe_build_debug_headers(
                 raw_headers=raw_headers,
                 scope=dict(scope),
                 mcp_servers=mcp_servers,
                 oauth2_headers=oauth2_headers,
                 client_ip=_client_ip,
+                user_api_key_auth=user_api_key_auth,
+                is_admin=_is_admin,
             )
-            diagnostics: Final = MCPAuthDiagnostics() if _debug_headers else None
+            diagnostics: Final = MCPAuthDiagnostics(is_admin=_is_admin) if _debug_headers else None
             if diagnostics is not None:
                 scope[MCP_AUTH_DIAGNOSTICS_SCOPE_KEY] = diagnostics
                 send = MCPDebug.wrap_send_with_debug_headers(

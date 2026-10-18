@@ -148,8 +148,9 @@ def record_auth_resolution(server_id: str, source: AuthResolution) -> None:
 
 
 class MCPAuthDiagnostics:
-    def __init__(self) -> None:
+    def __init__(self, is_admin: bool = True) -> None:
         self._outcomes: tuple[tuple[str, AuthResolution], ...] = ()
+        self._is_admin: Final = is_admin
 
     def record(self, server_id: str, resolution: AuthResolution) -> None:
         self._outcomes = tuple(item for item in self._outcomes if item[0] != server_id) + ((server_id, resolution),)
@@ -166,6 +167,9 @@ class MCPAuthDiagnostics:
                 return AuthResolution.multiple.value
 
     def headers(self) -> Mapping[str, str]:
+        if not self._is_admin:
+            return MappingProxyType({})
+
         from litellm.proxy._experimental.mcp_server.outbound_credentials.types import AuthResolution
 
         if len(self._outcomes) <= 1:
@@ -260,6 +264,30 @@ class MCPDebug:
         return False
 
     @staticmethod
+    def is_admin_auth(user_api_key_auth: object | None) -> bool:
+        """
+        Check if user_api_key_auth has proxy admin permissions.
+        """
+        if user_api_key_auth is None:
+            return False
+        if isinstance(user_api_key_auth, dict):
+            user_role = user_api_key_auth.get("user_role")
+        else:
+            user_role = getattr(user_api_key_auth, "user_role", None)
+        if not user_role:
+            return False
+        from litellm.types.proxy.auth.user_roles import LitellmUserRoles
+
+        return user_role in (
+            "proxy_admin",
+            "proxy_admin_viewer",
+            LitellmUserRoles.PROXY_ADMIN,
+            LitellmUserRoles.PROXY_ADMIN_VIEW_ONLY,
+            LitellmUserRoles.PROXY_ADMIN.value,
+            LitellmUserRoles.PROXY_ADMIN_VIEW_ONLY.value,
+        )
+
+    @staticmethod
     def build_debug_headers(
         *,
         inbound_headers: dict[str, str],
@@ -268,6 +296,7 @@ class MCPDebug:
         auth_resolution: str,
         server_url: str | None,
         server_auth_type: str | None,
+        is_admin: bool = True,
     ) -> dict[str, str]:
         """
         Build masked debug response headers.
@@ -287,6 +316,10 @@ class MCPDebug:
             Upstream MCP server URL.
         server_auth_type : str or None
             The ``auth_type`` configured on the server (e.g. ``oauth2``).
+        is_admin : bool
+            Whether the caller has proxy admin permissions. When False, internal
+            infrastructure headers (upstream URL, auth resolution, and server auth
+            type) are omitted to protect backend details from regular callers.
 
         Returns
         -------
@@ -318,12 +351,14 @@ class MCPDebug:
         else:
             debug[f"{_RESPONSE_HEADER_PREFIX}-oauth2-token"] = MCPDebug._mask(oauth2_token)
 
-        # --- Auth resolution ---
-        debug[f"{_RESPONSE_HEADER_PREFIX}-auth-resolution"] = auth_resolution
+        # --- Infrastructure headers (admin only) ---
+        if is_admin:
+            # --- Auth resolution ---
+            debug[f"{_RESPONSE_HEADER_PREFIX}-auth-resolution"] = auth_resolution
 
-        # --- Server info ---
-        debug[f"{_RESPONSE_HEADER_PREFIX}-outbound-url"] = server_url or "(unknown)"
-        debug[f"{_RESPONSE_HEADER_PREFIX}-server-auth-type"] = server_auth_type or "(none)"
+            # --- Server info ---
+            debug[f"{_RESPONSE_HEADER_PREFIX}-outbound-url"] = server_url or "(unknown)"
+            debug[f"{_RESPONSE_HEADER_PREFIX}-server-auth-type"] = server_auth_type or "(none)"
 
         return debug
 
@@ -361,6 +396,8 @@ class MCPDebug:
         mcp_servers: list[str] | None,
         oauth2_headers: dict[str, str] | None,
         client_ip: str | None,
+        user_api_key_auth: object | None = None,
+        is_admin: bool | None = None,
     ) -> dict[str, str]:
         """
         Build debug headers if debug mode is enabled, otherwise return empty dict.
@@ -369,6 +406,10 @@ class MCPDebug:
         """
         if not raw_headers or not MCPDebug.is_debug_enabled(raw_headers):
             return {}
+
+        admin_authorized: Final = (
+            is_admin if is_admin is not None else MCPDebug.is_admin_auth(user_api_key_auth)
+        )
 
         from litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp import (
             MCPRequestHandler,
@@ -383,12 +424,13 @@ class MCPDebug:
 
         auth_resolution: Final = AuthResolution.unresolved.value
 
-        for server_name in mcp_servers or []:
-            server = global_mcp_server_manager.get_mcp_server_by_name(server_name, client_ip=client_ip)
-            if server:
-                server_url = server.url
-                server_auth_type = server.auth_type
-                break
+        if admin_authorized:
+            for server_name in mcp_servers or []:
+                server = global_mcp_server_manager.get_mcp_server_by_name(server_name, client_ip=client_ip)
+                if server:
+                    server_url = server.url
+                    server_auth_type = server.auth_type
+                    break
 
         scope_headers: Final = MCPRequestHandler.safe_get_headers_from_scope(scope)
         litellm_key: Final = MCPRequestHandler.get_litellm_api_key_from_headers(scope_headers)
@@ -400,6 +442,7 @@ class MCPDebug:
             auth_resolution=auth_resolution,
             server_url=server_url,
             server_auth_type=server_auth_type,
+            is_admin=admin_authorized,
         )
 
 
