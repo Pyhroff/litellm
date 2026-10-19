@@ -99,3 +99,15 @@ async def test_transform_response_rejects_choices_that_are_not_a_list_of_objects
 async def test_transform_response_rejects_a_choice_whose_message_is_not_an_object():
     with pytest.raises(ValidationError, match="validation error for Choices"):
         await _transform({"choices": [{"message": "text"}]})
+
+
+async def test_transform_response_forwards_service_tier_onto_model_response():
+    response = await _transform(
+        {
+            "id": "chatcmpl-tier-test",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "hi"}}],
+            "service_tier": "flex",
+        }
+    )
+
+    assert response.service_tier == "flex"
