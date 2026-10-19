@@ -494,7 +494,7 @@ async def test_auth_not_connected_to_db():
     setattr(
         litellm.proxy.proxy_server,
         "general_settings",
-        {"allow_requests_on_db_unavailable": True},
+        {"allow_requests_on_db_unavailable": True, "database_url": "postgresql://test:test@localhost:5432/test"},
     )
 
     request = Request(scope={"type": "http", "method": "POST", "path": "/chat/completions", "headers": []})
@@ -504,6 +504,40 @@ async def test_auth_not_connected_to_db():
     print("got valid token", valid_token)
     assert valid_token.key_name == "failed-to-connect-to-db"
     assert valid_token.token == "failed-to-connect-to-db"
+
+
+@pytest.mark.asyncio
+async def test_auth_unconfigured_db_rejects_non_master_key_even_if_allow_requests_on_db_unavailable(monkeypatch):
+    """
+    Ensure non-master keys are rejected when no database is configured,
+    even if allow_requests_on_db_unavailable is True (#47119).
+    """
+    from fastapi import Request
+    from starlette.datastructures import URL
+
+    from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+    from litellm.proxy.proxy_server import user_api_key_cache
+
+    user_key = "sk-98765678"
+
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL_READ_REPLICA", raising=False)
+    setattr(litellm.proxy.proxy_server, "user_api_key_cache", user_api_key_cache)
+    setattr(litellm.proxy.proxy_server, "master_key", MASTER_KEY)
+    setattr(litellm.proxy.proxy_server, "prisma_client", None)
+    setattr(
+        litellm.proxy.proxy_server,
+        "general_settings",
+        {"allow_requests_on_db_unavailable": True},
+    )
+
+    request = Request(scope={"type": "http", "method": "POST", "path": "/chat/completions", "headers": []})
+    request._url = URL(url="/chat/completions")
+
+    with pytest.raises(Exception, match="Authentication Error") as exc_info:
+        await user_api_key_auth(request=request, api_key="Bearer " + user_key)
+
+    assert str(getattr(exc_info.value, "code", "")) == "401" or getattr(exc_info.value, "status_code", None) == 401
 
 
 def _assert_api_key_from_custom_header(headers, custom_header_name, expected_api_key):

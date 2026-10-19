@@ -2734,9 +2734,26 @@ async def user_api_key_auth_builder(
 
         ## Check DB
 
-        if (
-            prisma_client is None
-        ):  # if both master key + user key submitted, and user key != master key, and no db connected, raise an error
+        if prisma_client is None:
+            # if both master key + user key submitted, and user key != master key, and no db connected, raise an error
+            from litellm.secret_managers.main import get_secret
+
+            is_db_configured: Final = bool(
+                get_secret("DATABASE_URL", None)
+                or get_secret("DATABASE_URL_READ_REPLICA", None)
+                or (general_settings and general_settings.get("database_url"))
+            )
+            if not is_db_configured:
+                raise ProxyException(
+                    message=(
+                        "Authentication Error: Invalid API key. No database connected — "
+                        "only the master key is accepted for authentication. "
+                        "Set DATABASE_URL to enable virtual keys."
+                    ),
+                    type=ProxyErrorTypes.auth_error,
+                    code=status.HTTP_401_UNAUTHORIZED,
+                    param=None,
+                )
             raise ProxyException(
                 message="No connected db.",
                 type=ProxyErrorTypes.no_db_connection,
