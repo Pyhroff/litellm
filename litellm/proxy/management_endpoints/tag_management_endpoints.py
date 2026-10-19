@@ -31,6 +31,7 @@ from litellm.proxy.management_endpoints.common_daily_activity import (
     get_daily_activity,
 )
 from litellm.proxy.management_helpers.utils import handle_budget_for_entity
+from litellm.repositories.budget_repository import BudgetRepository
 from litellm.repositories.model_repository import ModelRepository
 from litellm.repositories.table_repositories import (
     DailyTagSpendRepository,
@@ -90,7 +91,13 @@ class _TagTableClient(Protocol):
     async def delete(self, where: Mapping[str, object]) -> "PrismaTagTable | None": ...
 
 
+class _BudgetTableClient(Protocol):
+    async def delete(self, where: Mapping[str, object]) -> object: ...
+
+
 class _ModelTableClient(Protocol):
+    async def find_unique(self, where: Mapping[str, object]) -> "PrismaProxyModelTable | None": ...
+
     async def find_many(self, where: Mapping[str, object] | None = None) -> "Sequence[PrismaProxyModelTable]": ...
 
 
@@ -118,6 +125,10 @@ class _DailyTagSpendTableClient(Protocol):
 
 
 @overload
+def _table(repository: BudgetRepository) -> "_BudgetTableClient": ...
+
+
+@overload
 def _table(repository: DailyTagSpendRepository) -> "_DailyTagSpendTableClient": ...
 
 
@@ -134,7 +145,13 @@ def _table(repository: VerificationTokenRepository) -> "_VerificationTokenTableC
 
 
 def _table(
-    repository: DailyTagSpendRepository | ModelRepository | TagRepository | VerificationTokenRepository,
+    repository: (
+        BudgetRepository
+        | DailyTagSpendRepository
+        | ModelRepository
+        | TagRepository
+        | VerificationTokenRepository
+    ),
 ) -> object:
     prisma_table: Final[object] = repository.table
     return prisma_table
@@ -284,11 +301,41 @@ async def new_tag(
         raise HTTPException(status_code=500, detail=CommonProxyErrors.db_not_connected_error.value)
     if llm_router is None:
         raise HTTPException(status_code=500, detail=CommonProxyErrors.no_llm_router.value)
+    created_budget_id: str | None = None  # rebind-ok: tracked for atomic rollback
+    new_tag_created: bool = False  # rebind-ok: tracked for atomic rollback
+
     try:
         # Check if tag already exists
         existing_tag: Final = await _table(TagRepository(prisma_client)).find_unique(where={"tag_name": tag.name})
         if existing_tag is not None:
             raise HTTPException(status_code=400, detail=f"Tag {tag.name} already exists")
+
+        # Pre-flight deployment validation:
+        # Validate that model deployments exist in the database before creating budget or tag records.
+        deployments_to_tag: Final[list[Deployment]] = []  # mutable-ok: accumulated in loop
+        seen_deployment_ids: Final[set[str]] = set()  # mutable-ok: deduplication set
+        if tag.models:
+            for model in tag.models:
+                deployments: Final = await get_deployments_by_model(model, llm_router)
+                for deployment in deployments:
+                    deployment_id: Final = deployment.model_info.id
+                    if not deployment_id:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Deployment for model '{model}' has no model_id",
+                        )
+                    if deployment_id in seen_deployment_ids:
+                        continue
+                    seen_deployment_ids.add(deployment_id)
+                    db_model: Final = await _table(ModelRepository(prisma_client)).find_unique(
+                        where={"model_id": deployment_id}
+                    )
+                    if db_model is None:
+                        raise HTTPException(
+                            status_code=404,
+                            detail=f"Model {deployment_id} not found in database",
+                        )
+                    deployments_to_tag.append(deployment)
 
         # Handle budget creation/assignment using common helper
         budget_id: Final = await handle_budget_for_entity(
@@ -298,6 +345,8 @@ async def new_tag(
             prisma_client=prisma_client,
             litellm_proxy_admin_name=litellm_proxy_admin_name,
         )
+        if tag.budget_id is None and budget_id is not None:
+            created_budget_id = budget_id  # rebind-ok: tracked for rollback
 
         # Get model names for model_info
         model_info: Final = await _get_model_names(prisma_client, tag.models or [])
@@ -314,23 +363,19 @@ async def new_tag(
                 "created_by": user_api_key_dict.user_id,
             }
         )
+        new_tag_created = True  # rebind-ok: tracked for rollback
 
         await _evict_tag_cache_keys((tag_cache_key(tag.name), tag_registry_cache_key()))
 
         # Update models with new tag
-        if tag.models:
-            tasks: Final = []
-            for model in tag.models:
-                deployments = await get_deployments_by_model(model, llm_router)
-                tasks.extend(
-                    [
-                        _add_tag_to_deployment(
-                            deployment=deployment,
-                            tag=tag.name,
-                        )
-                        for deployment in deployments
-                    ]
+        if deployments_to_tag:
+            tasks: Final = [
+                _add_tag_to_deployment(
+                    deployment=deployment,
+                    tag=tag.name,
                 )
+                for deployment in deployments_to_tag
+            ]
             await asyncio.gather(*tasks)
 
         # Build response
@@ -349,6 +394,22 @@ async def new_tag(
             "tag": tag_config,
         }
     except Exception as e:
+        # Atomic rollback: clean up partially created records to prevent orphaned state
+        if new_tag_created:
+            try:
+                await _table(TagRepository(prisma_client)).delete(where={"tag_name": tag.name})
+                await _evict_tag_cache_keys((tag_cache_key(tag.name), tag_registry_cache_key()))
+            except Exception as cleanup_err:
+                verbose_proxy_logger.error("Failed to rollback tag '%s': %s", tag.name, cleanup_err)
+
+        if created_budget_id is not None:
+            try:
+                await _table(BudgetRepository(prisma_client)).delete(where={"budget_id": created_budget_id})
+            except Exception as cleanup_err:
+                verbose_proxy_logger.error("Failed to rollback budget '%s': %s", created_budget_id, cleanup_err)
+
+        if isinstance(e, HTTPException):
+            raise e
         verbose_proxy_logger.exception("Error creating tag: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -362,7 +423,9 @@ async def _add_tag_to_deployment(deployment: "Deployment", tag: str):
 
     try:
         # Get current model from database to preserve encrypted fields
-        db_model = await ModelRepository(prisma_client).table.find_unique(where={"model_id": deployment.model_info.id})
+        db_model: Final = await _table(ModelRepository(prisma_client)).find_unique(
+            where={"model_id": deployment.model_info.id}
+        )
 
         if db_model is None:
             raise HTTPException(
@@ -371,18 +434,30 @@ async def _add_tag_to_deployment(deployment: "Deployment", tag: str):
             )
 
         # Prisma returns litellm_params as dict (already parsed from JSON)
-        existing_params = db_model.litellm_params
-        if isinstance(existing_params, str):  # pyright: ignore[reportUnnecessaryIsInstance]  # prisma Json stub is str
-            # If it's a string, parse it
-            existing_params = json.loads(existing_params)
-        elif not isinstance(existing_params, dict):  # pyright: ignore[reportUnnecessaryIsInstance]  # prisma Json stub
-            raise Exception(f"Unexpected litellm_params type: {type(existing_params)}")
+        raw_params: Final = db_model.litellm_params
+        existing_params: Final[dict[str, object]]  # mutable-ok: mutable dict updated before serializing
+        if isinstance(raw_params, str):  # pyright: ignore[reportUnnecessaryIsInstance]  # prisma Json stub is str
+            existing_params = json.loads(raw_params)
+        elif isinstance(raw_params, dict):  # pyright: ignore[reportUnnecessaryIsInstance]  # prisma Json stub
+            existing_params = dict(raw_params)
+        else:
+            raise Exception(f"Unexpected litellm_params type: {type(raw_params)}")
 
         # Add tag to tags array (preserve encryption of other fields)
+        tags_list: Final[list[object]]  # mutable-ok: list modified in-place
         if "tags" not in existing_params:
-            existing_params["tags"] = []
-        if tag not in existing_params["tags"]:
-            existing_params["tags"].append(tag)
+            tags_list = []
+            existing_params["tags"] = tags_list
+        else:
+            raw_tags: Final = existing_params["tags"]
+            if isinstance(raw_tags, list):
+                tags_list = raw_tags
+            else:
+                tags_list = list(raw_tags) if isinstance(raw_tags, (tuple, set)) else []
+                existing_params["tags"] = tags_list
+
+        if tag not in tags_list:
+            tags_list.append(tag)
 
         # Update database with modified params (keeps encrypted fields encrypted)
         await ModelRepository(prisma_client).table.update(
@@ -482,6 +557,8 @@ async def update_tag(
             "tag": tag_config,
         }
     except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
         verbose_proxy_logger.exception("Error updating tag: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 

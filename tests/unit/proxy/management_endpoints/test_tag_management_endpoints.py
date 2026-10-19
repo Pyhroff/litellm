@@ -1586,3 +1586,151 @@ def test_tag_info_and_tag_list_return_the_stored_model_info_decoded(
     assert info_response.json()["routed-tag"]["model_info"] == returned_model_info
     assert list_response.status_code == 200
     assert [tag["model_info"] for tag in list_response.json()] == [returned_model_info]
+
+
+@pytest.mark.asyncio
+async def test_new_tag_deployment_not_in_db_fails_preflight_without_orphaned_tag_or_budget() -> None:
+    """Issue #47005: When a model deployment is not in the database, /tag/new must fail
+
+    fast during pre-flight validation before any tag or budget rows are written, so that
+    no orphan records are left behind and retries are not blocked by 'Tag already exists'.
+    """
+    from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+    from litellm.types.router import Deployment, LiteLLM_Params, ModelInfo
+
+    mock_user_auth: Final = UserAPIKeyAuth(
+        user_id="test-user-123",
+        user_role=LitellmUserRoles.PROXY_ADMIN,
+    )
+    app.dependency_overrides[user_api_key_auth] = lambda: mock_user_auth
+
+    mock_deployment: Final = Deployment(
+        model_name="unregistered-model",
+        litellm_params=LiteLLM_Params(model="unregistered-model"),
+        model_info=ModelInfo(id="dep-missing-123"),
+    )
+
+    try:
+        with (
+            patch("litellm.proxy.proxy_server.prisma_client") as mock_prisma,
+            patch("litellm.proxy.proxy_server.llm_router"),
+            patch("litellm.proxy.proxy_server.litellm_proxy_admin_name", "default_user_id"),
+            patch(
+                "litellm.proxy.management_endpoints.tag_management_endpoints.get_deployments_by_model",
+                return_value=[mock_deployment],
+            ),
+        ):
+            mock_db: Final = Mock()
+            mock_prisma.db = mock_db
+            mock_prisma.jsonify_object = lambda data: dict(data)
+
+            # Tag does not exist yet
+            mock_db.litellm_tagtable.find_unique = AsyncMock(return_value=None)
+            mock_db.litellm_tagtable.create = AsyncMock()
+            mock_db.litellm_budgettable.create = AsyncMock()
+            # Model deployment is NOT in the DB
+            mock_db.litellm_proxymodeltable.find_unique = AsyncMock(return_value=None)
+
+            tag_data: Final = {
+                "name": "orphan-test-tag",
+                "models": ["unregistered-model"],
+                "max_budget": 100.0,
+            }
+            response: Final = client.post("/tag/new", json=tag_data, headers={"Authorization": "Bearer sk-123"})
+
+            # Must fail with 404 (not 500)
+            assert response.status_code == 404
+            assert "dep-missing-123 not found in database" in response.text
+
+            # Crucial assertion: neither tag nor budget was created in DB!
+            mock_db.litellm_tagtable.create.assert_not_called()
+            mock_db.litellm_budgettable.create.assert_not_called()
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_new_tag_atomic_rollback_on_failure_cleans_up_tag_and_budget() -> None:
+    """Issue #47005: If model tagging fails after tag and budget rows are created,
+
+    atomic rollback must delete both the newly created tag and budget rows.
+    """
+    from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+    from litellm.types.router import Deployment, LiteLLM_Params, ModelInfo
+
+    mock_user_auth: Final = UserAPIKeyAuth(
+        user_id="test-user-123",
+        user_role=LitellmUserRoles.PROXY_ADMIN,
+    )
+    app.dependency_overrides[user_api_key_auth] = lambda: mock_user_auth
+
+    mock_deployment: Final = Deployment(
+        model_name="model-1",
+        litellm_params=LiteLLM_Params(model="model-1"),
+        model_info=ModelInfo(id="dep-1"),
+    )
+
+    try:
+        with (
+            patch("litellm.proxy.proxy_server.prisma_client") as mock_prisma,
+            patch("litellm.proxy.proxy_server.llm_router"),
+            patch("litellm.proxy.proxy_server.litellm_proxy_admin_name", "default_user_id"),
+            patch(
+                "litellm.proxy.management_endpoints.tag_management_endpoints.get_deployments_by_model",
+                return_value=[mock_deployment],
+            ),
+            patch(
+                "litellm.proxy.management_endpoints.tag_management_endpoints._evict_tag_cache_keys",
+                new_callable=AsyncMock,
+            ) as mock_evict,
+            patch(
+                "litellm.proxy.management_endpoints.tag_management_endpoints._add_tag_to_deployment",
+                side_effect=RuntimeError("Simulated database failure during model tagging"),
+            ),
+        ):
+            mock_db: Final = Mock()
+            mock_prisma.db = mock_db
+            mock_prisma.jsonify_object = lambda data: dict(data)
+
+            # Tag does not exist yet
+            mock_db.litellm_tagtable.find_unique = AsyncMock(return_value=None)
+            mock_db.litellm_tagtable.delete = AsyncMock()
+
+            # Pre-flight deployment check passes
+            mock_model: Final = Mock()
+            mock_model.model_id = "dep-1"
+            mock_model.model_name = "model-1"
+            mock_db.litellm_proxymodeltable.find_unique = AsyncMock(return_value=mock_model)
+            mock_db.litellm_proxymodeltable.find_many = AsyncMock(return_value=[mock_model])
+
+            created_budget: Final = SimpleNamespace(budget_id="budget-orphan-test-123")
+            mock_db.litellm_budgettable.create = AsyncMock(return_value=created_budget)
+            mock_db.litellm_budgettable.delete = AsyncMock()
+
+            created_tag: Final = Mock()
+            created_tag.tag_name = "rollback-test-tag"
+            created_tag.description = None
+            created_tag.models = ["model-1"]
+            created_tag.budget_id = "budget-orphan-test-123"
+            created_tag.created_at = datetime.now()
+            created_tag.updated_at = datetime.now()
+            created_tag.created_by = "test-user-123"
+            mock_db.litellm_tagtable.create = AsyncMock(return_value=created_tag)
+
+            tag_data: Final = {
+                "name": "rollback-test-tag",
+                "models": ["model-1"],
+                "max_budget": 50.0,
+            }
+            response: Final = client.post("/tag/new", json=tag_data, headers={"Authorization": "Bearer sk-123"})
+
+            assert response.status_code == 500
+            assert "Simulated database failure" in response.text
+
+            # Verify atomic rollback deleted both tag and budget
+            mock_db.litellm_tagtable.delete.assert_called_once_with(where={"tag_name": "rollback-test-tag"})
+            mock_db.litellm_budgettable.delete.assert_called_once_with(where={"budget_id": "budget-orphan-test-123"})
+            # Verify cache eviction was invoked during rollback
+            assert mock_evict.call_count >= 1
+    finally:
+        app.dependency_overrides.clear()
