@@ -1586,3 +1586,141 @@ def test_tag_info_and_tag_list_return_the_stored_model_info_decoded(
     assert info_response.json()["routed-tag"]["model_info"] == returned_model_info
     assert list_response.status_code == 200
     assert [tag["model_info"] for tag in list_response.json()] == [returned_model_info]
+
+
+@pytest.mark.asyncio
+async def test_tag_partial_update_preserves_description_and_models() -> None:
+    """Test that /tag/update with only budget parameters preserves existing description,
+
+    models, and model_info instead of wiping them out.
+    """
+    from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+
+    mock_user_auth: Final = UserAPIKeyAuth(
+        user_id="test-user-123",
+        user_role=LitellmUserRoles.PROXY_ADMIN,
+    )
+    app.dependency_overrides[user_api_key_auth] = lambda: mock_user_auth
+
+    existing_tag: Final = Mock()
+    existing_tag.tag_name = "test-tag"
+    existing_tag.description = "Persistent description"
+    existing_tag.models = ["gpt-4o"]
+    existing_tag.model_info = json.dumps({"gpt-4o": "gpt-4o"})
+    existing_tag.budget_id = "budget-1"
+    existing_tag.created_at = datetime.now()
+    existing_tag.updated_at = datetime.now()
+    existing_tag.created_by = "test-user-123"
+
+    updated_tag: Final = Mock()
+    updated_tag.tag_name = "test-tag"
+    updated_tag.description = "Persistent description"
+    updated_tag.models = ["gpt-4o"]
+    updated_tag.model_info = json.dumps({"gpt-4o": "gpt-4o"})
+    updated_tag.budget_id = "budget-1"
+    updated_tag.created_at = datetime.now()
+    updated_tag.updated_at = datetime.now()
+    updated_tag.created_by = "test-user-123"
+
+    mock_db: Final = Mock()
+    mock_db.litellm_tagtable.find_unique = AsyncMock(return_value=existing_tag)
+    mock_db.litellm_tagtable.update = AsyncMock(return_value=updated_tag)
+    mock_db.litellm_budgettable.update = AsyncMock(return_value=Mock(budget_id="budget-1"))
+    mock_db.litellm_proxymodeltable.find_many = AsyncMock(return_value=[])
+
+    mock_prisma: Final = Mock()
+    mock_prisma.db = mock_db
+
+    try:
+        with (
+            patch("litellm.proxy.proxy_server.prisma_client", mock_prisma),
+            patch("litellm.proxy.proxy_server.litellm_proxy_admin_name", "admin"),
+            patch(
+                "litellm.proxy.management_endpoints.tag_management_endpoints._evict_tag_cache_keys",
+                new_callable=AsyncMock,
+            ),
+        ):
+            update_data: Final = {
+                "name": "test-tag",
+                "max_budget": 200.0,
+            }
+            response: Final = client.post(
+                "/tag/update",
+                json=update_data,
+                headers={"Authorization": "Bearer sk-123"},
+            )
+            assert response.status_code == 200, response.text
+            result: Final = response.json()
+            assert result["message"] == "Tag test-tag updated successfully"
+            assert result["tag"]["description"] == "Persistent description"
+            assert result["tag"]["models"] == ["gpt-4o"]
+
+            # Verify that update was called without overwriting description or models
+            mock_db.litellm_tagtable.update.assert_awaited_once()
+            called_kwargs: Final = mock_db.litellm_tagtable.update.await_args.kwargs
+            called_data: Final = called_kwargs["data"]
+            assert "description" not in called_data
+            assert "models" not in called_data
+            assert "model_info" not in called_data
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_tag_info_missing_tag_returns_404() -> None:
+    """Test that POST /tag/info with a non-existent tag returns HTTP 404 instead of 500."""
+    from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+
+    mock_user_auth: Final = UserAPIKeyAuth(
+        user_id="test-user-123",
+        user_role=LitellmUserRoles.PROXY_ADMIN,
+    )
+    app.dependency_overrides[user_api_key_auth] = lambda: mock_user_auth
+
+    mock_db: Final = Mock()
+    mock_db.litellm_tagtable.find_many = AsyncMock(return_value=[])
+
+    mock_prisma: Final = Mock()
+    mock_prisma.db = mock_db
+
+    try:
+        with patch("litellm.proxy.proxy_server.prisma_client", mock_prisma):
+            response: Final = client.post(
+                "/tag/info",
+                json={"names": ["missing-tag"]},
+                headers={"Authorization": "Bearer sk-123"},
+            )
+            assert response.status_code == 404
+            assert "Tags not found: ['missing-tag']" in response.text
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_tag_delete_nonexistent_tag_returns_404() -> None:
+    """Test that POST /tag/delete with a non-existent tag returns HTTP 404 instead of 500."""
+    from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+
+    mock_user_auth: Final = UserAPIKeyAuth(
+        user_id="test-user-123",
+        user_role=LitellmUserRoles.PROXY_ADMIN,
+    )
+    app.dependency_overrides[user_api_key_auth] = lambda: mock_user_auth
+
+    mock_db: Final = Mock()
+    mock_db.litellm_tagtable.find_unique = AsyncMock(return_value=None)
+
+    mock_prisma: Final = Mock()
+    mock_prisma.db = mock_db
+
+    try:
+        with patch("litellm.proxy.proxy_server.prisma_client", mock_prisma):
+            response: Final = client.post(
+                "/tag/delete",
+                json={"name": "missing-tag"},
+                headers={"Authorization": "Bearer sk-123"},
+            )
+            assert response.status_code == 404
+            assert "Tag missing-tag not found" in response.text
+    finally:
+        app.dependency_overrides.clear()

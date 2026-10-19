@@ -444,15 +444,31 @@ async def update_tag(
             cleared_budget_fields=frozenset(field for field in tag.model_fields_set if getattr(tag, field) is None),
         )
 
-        # Get model names for model_info
-        model_info: Final = await _get_model_names(prisma_client, tag.models or [])
+        # Prepare update data for fields explicitly provided in the request
+        update_data: Final[dict[str, object]] = {}  # mutable-ok: built conditionally from provided fields
+        async def _resolve_updated_model_info() -> Mapping[str, str]:
+            if "models" in tag.model_fields_set:
+                return await _get_model_names(prisma_client, tag.models or [])
+            raw_model_info: Final = getattr(existing_tag, "model_info", None)
+            if isinstance(raw_model_info, str):
+                try:
+                    parsed_info: Final = _DECODED_JSON.validate_python(json.loads(raw_model_info))
+                    if isinstance(parsed_info, dict):
+                        return {str(k): str(v) for k, v in parsed_info.items()}
+                except Exception:
+                    return {}
+            elif isinstance(raw_model_info, dict):
+                return {str(k): str(v) for k, v in raw_model_info.items()}
+            return {}
 
-        # Prepare update data
-        update_data: Final = {
-            "description": tag.description,
-            "models": tag.models or [],
-            "model_info": json.dumps(model_info),
-        }
+        model_info: Final[Mapping[str, str]] = await _resolve_updated_model_info()
+
+        if "description" in tag.model_fields_set:
+            update_data["description"] = tag.description
+
+        if "models" in tag.model_fields_set:
+            update_data["models"] = tag.models or []
+            update_data["model_info"] = json.dumps(dict(model_info))
 
         # Add budget_id if it changed
         if budget_id != existing_tag.budget_id:
@@ -471,7 +487,7 @@ async def update_tag(
             name=updated_tag_record.tag_name,
             description=updated_tag_record.description,
             models=updated_tag_record.models,
-            model_info=model_info,
+            model_info=dict(model_info) if model_info else {},
             created_at=updated_tag_record.created_at.isoformat(),
             updated_at=updated_tag_record.updated_at.isoformat(),
             created_by=updated_tag_record.created_by,
@@ -482,6 +498,8 @@ async def update_tag(
             "tag": tag_config,
         }
     except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
         verbose_proxy_logger.exception("Error updating tag: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -548,6 +566,8 @@ async def info_tag(
 
         return requested_tags
     except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -683,6 +703,8 @@ async def list_tags(
 
         return list_of_tags + dynamic_tag_config
     except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -719,6 +741,8 @@ async def delete_tag(
 
         return {"message": f"Tag {data.name} deleted successfully"}
     except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
         raise HTTPException(status_code=500, detail=str(e))
 
 
