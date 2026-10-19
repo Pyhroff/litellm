@@ -6760,13 +6760,13 @@ class StandardLoggingPayloadSetup:
         headers: Final = proxy_server_request.get("headers", {})
         if not isinstance(headers, dict):
             return None
-        request_headers: Final = cast(  # cast-ok: request headers are untyped framework data
-            dict[str, str], headers
-        )
+        lower_headers: Final[dict[str, str]] = {  # mutable-ok: case-folding lookup map
+            k.lower(): str(v) for k, v in headers.items() if isinstance(k, str) and v is not None
+        }
 
-        header_tags: Final = []
+        header_tags: Final[list[str]] = []  # mutable-ok: accumulator list
         for header_name in extra_headers:
-            header_value = request_headers.get(header_name)
+            header_value: Final = lower_headers.get(header_name.lower())
             if header_value:
                 header_tags.append(f"{header_name}: {header_value}")
 
