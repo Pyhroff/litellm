@@ -234,3 +234,47 @@ async def test_guardrail_observes_saved_server_creation_and_deletion_on_another_
             await guardrail.async_pre_call_hook(UserAPIKeyAuth(), MagicMock(), data, call_type)
     assert exc.value.status_code == 400
     assert exc.value.detail["unregistered_servers"] == ["peer-server"]
+
+
+@pytest.mark.asyncio
+async def test_blocks_external_unregistered_mcp_server_by_default(guardrail):
+    data = {
+        "tools": [{"type": "mcp", "server_url": "https://untrusted-server.com/sse"}],
+        "guardrails": ["test-mcp-security"],
+    }
+    with patch(
+        "litellm.proxy._experimental.mcp_server.mcp_server_manager.global_mcp_server_manager"
+    ) as mock_manager:
+        mock_manager.get_registry.return_value = {"zapier": MagicMock()}
+        with pytest.raises(HTTPException) as exc:
+            await guardrail.async_pre_call_hook(UserAPIKeyAuth(), MagicMock(), data, "acompletion")
+        assert exc.value.status_code == 400
+        assert "https://untrusted-server.com/sse" in exc.value.detail["unregistered_servers"]
+
+
+@pytest.mark.asyncio
+async def test_allows_external_mcp_server_when_configured():
+    permissive_guardrail = MCPSecurityGuardrail(
+        guardrail_name="test-permissive",
+        event_hook=GuardrailEventHooks.pre_call,
+        allow_external_servers=True,
+    )
+    data = {
+        "tools": [{"type": "mcp", "server_url": "https://external-server.com/sse"}],
+        "guardrails": ["test-permissive"],
+    }
+    with patch(
+        "litellm.proxy._experimental.mcp_server.mcp_server_manager.global_mcp_server_manager"
+    ) as mock_manager:
+        mock_manager.get_registry.return_value = {}
+        result = await permissive_guardrail.async_pre_call_hook(UserAPIKeyAuth(), MagicMock(), data, "acompletion")
+        assert result == data
+
+
+def test_extract_mcp_server_info_proxy_path_url():
+    tools = [
+        {"type": "mcp", "server_url": "https://gateway.internal:8000/mcp/internal_tool"},
+    ]
+    registered, unregistered = MCPSecurityGuardrail._extract_mcp_server_info_from_tools(tools, allow_external_servers=False)
+    assert registered == {"internal_tool"}
+    assert unregistered == set()

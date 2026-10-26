@@ -18,6 +18,10 @@ from litellm.integrations.custom_guardrail import (
     log_guardrail_information,
 )
 from litellm.proxy._types import LiteLLM_ObjectPermissionTable
+from litellm.responses.mcp.tool_precheck import (
+    LITELLM_PROXY_MCP_SERVER_URL_PREFIX,
+    proxy_path_mcp_name,
+)
 from litellm.types.guardrails import GuardrailEventHooks
 from litellm.types.utils import GenericGuardrailAPIInputs
 
@@ -88,19 +92,21 @@ class MCPEndUserPermissionGuardrail(CustomGuardrail):
 
         for tool in tools:
             tool_name = self._get_tool_name_from_definition(tool)
-            server_name = self._extract_mcp_server_name(tool_name) if tool_name else None
+            server_name, is_mcp = self._resolve_tool_mcp_info(tool, tool_name)
 
-            if server_name is None:
-                # Not an MCP tool (no prefix) or unrecognised format → keep
+            if not is_mcp:
+                # Regular non-MCP tool → keep
                 filtered_tools.append(tool)
-            elif server_name in allowed_mcp_servers:
+            elif server_name and server_name in allowed_mcp_servers:
                 filtered_tools.append(tool)
             else:
-                removed_tools.append(tool_name)
+                removed_id = tool_name or (tool.get("server_url") if isinstance(tool, dict) else str(tool))
+                removed_tools.append(removed_id)
                 verbose_proxy_logger.warning(
-                    "MCP guardrail: removing tool '%s' (server: '%s') — not in end user's allowed servers",
-                    tool_name,
+                    "MCP guardrail: removing MCP tool '%s' (server: '%s') — not in end user's allowed servers %s",
+                    removed_id,
                     server_name,
+                    allowed_mcp_servers,
                 )
 
         if removed_tools:
@@ -218,6 +224,44 @@ class MCPEndUserPermissionGuardrail(CustomGuardrail):
     # ------------------------------------------------------------------
     # Private — tool name extraction
     # ------------------------------------------------------------------
+
+    @classmethod
+    def _resolve_tool_mcp_info(cls, tool: object, tool_name: str | None) -> tuple[str | None, bool]:
+        """
+        Determines if a tool definition is an MCP tool and extracts its MCP server name.
+        Returns:
+            (server_name, is_mcp_tool)
+        """
+        is_mcp = False
+        server_name = None
+
+        if isinstance(tool, dict):
+            if tool.get("type") == "mcp":
+                is_mcp = True
+
+            if "server_name" in tool and isinstance(tool["server_name"], str):
+                server_name = tool["server_name"]
+                is_mcp = True
+            elif "server_url" in tool and isinstance(tool["server_url"], str):
+                s_url = tool["server_url"]
+                if s_url.startswith(LITELLM_PROXY_MCP_SERVER_URL_PREFIX):
+                    server_name = s_url[len(LITELLM_PROXY_MCP_SERVER_URL_PREFIX) :]
+                    is_mcp = True
+                else:
+                    extracted = proxy_path_mcp_name(tool)
+                    if extracted:
+                        server_name = extracted
+                        is_mcp = True
+                    else:
+                        is_mcp = True  # External or unknown MCP server URL
+
+        if not server_name and tool_name:
+            extracted_name = cls._extract_mcp_server_name(tool_name)
+            if extracted_name:
+                server_name = extracted_name
+                is_mcp = True
+
+        return server_name, is_mcp
 
     @staticmethod
     def _extract_mcp_server_name(tool_name: str) -> str | None:

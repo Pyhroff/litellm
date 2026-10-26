@@ -22,11 +22,14 @@ def initialize_guardrail(
 
     on_violation: Final[Literal["block", "alert"]] = "block" if litellm_params.on_violation == "block" else "alert"
 
+    allow_external_servers: bool = getattr(litellm_params, "allow_external_servers", False) or guardrail.get("allow_external_servers", False)
+
     mcp_security_guardrail: Final = MCPSecurityGuardrail(
         guardrail_name=guardrail_name,
         event_hook=litellm_params.mode,
         default_on=litellm_params.default_on or False,
         on_violation=on_violation,
+        allow_external_servers=allow_external_servers,
     )
 
     litellm.logging_callback_manager.add_litellm_callback(mcp_security_guardrail)

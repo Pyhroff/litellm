@@ -349,3 +349,43 @@ class TestMCPEndUserPermissionGuardrail:
 
         assert result == inputs
         assert "tools" not in result
+
+    @pytest.mark.asyncio
+    async def test_fail_closed_on_unauthorized_mcp_tools(self):
+        """Test guardrail fails closed on unauthorized or unrecognised MCP tools when end user is restricted."""
+        from litellm.proxy._types import LiteLLM_ObjectPermissionTable
+
+        guardrail = MCPEndUserPermissionGuardrail()
+        inputs = {
+            "tools": [
+                {"type": "mcp", "server_url": "litellm_proxy/mcp/github"},
+                {"type": "mcp", "server_url": "litellm_proxy/mcp/unauthorized_server"},
+                {"type": "mcp", "server_url": "https://external-unregistered.com/mcp"},
+                {"type": "function", "function": {"name": "github-create_issue"}},
+                {"type": "function", "function": {"name": "unauthorized-delete_db"}},
+                {"type": "function", "function": {"name": "regular_search"}},
+            ]
+        }
+        request_data = {"user_api_key_end_user_id": "restricted-user"}
+
+        with patch.object(
+            MCPEndUserPermissionGuardrail,
+            "_fetch_end_user_object",
+            return_value=MagicMock(
+                object_permission=LiteLLM_ObjectPermissionTable(
+                    object_permission_id="perm-2",
+                    mcp_servers=["github"],
+                )
+            ),
+        ):
+            result = await guardrail.apply_guardrail(
+                inputs=inputs,
+                request_data=request_data,
+                input_type="request",
+            )
+            kept_tools = result.get("tools", [])
+            # Allowed: github (mcp tool), github-create_issue (prefixed function), regular_search (non-MCP tool)
+            assert len(kept_tools) == 3
+            assert kept_tools[0] == {"type": "mcp", "server_url": "litellm_proxy/mcp/github"}
+            assert kept_tools[1]["function"]["name"] == "github-create_issue"
+            assert kept_tools[2]["function"]["name"] == "regular_search"
